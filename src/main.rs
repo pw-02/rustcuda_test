@@ -1,58 +1,134 @@
-#[macro_use]
-extern crate rustacuda;
+use std::time::Instant;
 
-#[macro_use]
-extern crate rustacuda_derive;
-extern crate rustacuda_core;
+use blstrs::Scalar as Fr;
+use ec_gpu_gen::{
+    fft::FftKernel,
+    fft_cpu::{parallel_fft, serial_fft},
+    rust_gpu_tools::Device,
+    threadpool::Worker,
+};
+use ff::{Field, PrimeField};
 
-use rustacuda::prelude::*;
-use rustacuda::memory::DeviceBox;
-use std::error::Error;
-use std::ffi::CString;
-
-fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize the CUDA API
-    rustacuda::init(CudaFlags::empty())?;
-    
-    // Get the first device
-    let device = Device::get_device(0)?;
-
-    // Create a context associated to this device
-    let context = Context::create_and_push(
-        ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)?;
-
-    // Load the module containing the function we want to call
-    let module_data = CString::new(include_str!("../resources/add.ptx"))?;
-    let module = Module::load_from_string(&module_data)?;
-
-    // Create a stream to submit work to
-    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
-
-    // Allocate space on the device and copy numbers to it.
-    let mut x = DeviceBox::new(&10.0f32)?;
-    let mut y = DeviceBox::new(&20.0f32)?;
-    let mut result = DeviceBox::new(&0.0f32)?;
-
-    // Launching kernels is unsafe since Rust can't enforce safety - think of kernel launches
-    // as a foreign-function call. In this case, it is - this kernel is written in CUDA C.
-    unsafe {
-        // Launch the `sum` function with one block containing one thread on the given stream.
-        launch!(module.sum<<<1, 1, 0, stream>>>(
-            x.as_device_ptr(),
-            y.as_device_ptr(),
-            result.as_device_ptr(),
-            1 // Length
-        ))?;
+fn omega<F: PrimeField>(num_coeffs: usize) -> F {
+    // Compute omega, the 2^exp primitive root of unity
+    let exp = (num_coeffs as f32).log2().floor() as u32;
+    let mut omega = F::ROOT_OF_UNITY;
+    for _ in exp..F::S {
+        omega = omega.square();
     }
+    omega
+}
 
-    // The kernel launch is asynchronous, so we wait for the kernel to finish executing
-    stream.synchronize()?;
+#[test]
+pub fn gpu_fft_consistency() {
+    fil_logger::maybe_init();
+    let mut rng = rand::thread_rng();
 
-    // Copy the result back to the host
-    let mut result_host = 0.0f32;
-    result.copy_to(&mut result_host)?;
-    
-    println!("Sum is {}", result_host);
+    let worker = Worker::new();
+    let log_threads = worker.log_num_threads();
+    let devices = Device::all();
+    let programs = devices
+        .iter()
+        .map(|device| ec_gpu_gen::program!(device))
+        .collect::<Result<_, _>>()
+        .expect("Cannot create programs!");
+    let mut kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
 
-    Ok(())
+    for log_d in 1..=20 {
+        let d = 1 << log_d;
+
+        let mut v1_coeffs = (0..d).map(|_| Fr::random(&mut rng)).collect::<Vec<_>>();
+        let v1_omega = omega::<Fr>(v1_coeffs.len());
+        let mut v2_coeffs = v1_coeffs.clone();
+        let v2_omega = v1_omega;
+
+        println!("Testing FFT for {} elements...", d);
+
+        let mut now = Instant::now();
+        kern.radix_fft_many(&mut [&mut v1_coeffs], &[v1_omega], &[log_d])
+            .expect("GPU FFT failed!");
+        let gpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
+        println!("GPU took {}ms.", gpu_dur);
+
+        now = Instant::now();
+        if log_d <= log_threads {
+            serial_fft::<Fr>(&mut v2_coeffs, &v2_omega, log_d);
+        } else {
+            parallel_fft::<Fr>(&mut v2_coeffs, &worker, &v2_omega, log_d, log_threads);
+        }
+        let cpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
+        println!("CPU ({} cores) took {}ms.", 1 << log_threads, cpu_dur);
+
+        println!("Speedup: x{}", cpu_dur as f32 / gpu_dur as f32);
+
+        assert!(v1_coeffs == v2_coeffs);
+        println!("============================");
+    }
+}
+
+#[test]
+pub fn gpu_fft_many_consistency() {
+    fil_logger::maybe_init();
+    let mut rng = rand::thread_rng();
+
+    let worker = Worker::new();
+    let log_threads = worker.log_num_threads();
+    let devices = Device::all();
+    let programs = devices
+        .iter()
+        .map(|device| ec_gpu_gen::program!(device))
+        .collect::<Result<_, _>>()
+        .expect("Cannot create programs!");
+    let mut kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
+
+    for log_d in 1..=20 {
+        let d = 1 << log_d;
+
+        let mut v11_coeffs = (0..d).map(|_| Fr::random(&mut rng)).collect::<Vec<_>>();
+        let mut v12_coeffs = (0..d).map(|_| Fr::random(&mut rng)).collect::<Vec<_>>();
+        let mut v13_coeffs = (0..d).map(|_| Fr::random(&mut rng)).collect::<Vec<_>>();
+        let v11_omega = omega::<Fr>(v11_coeffs.len());
+        let v12_omega = omega::<Fr>(v12_coeffs.len());
+        let v13_omega = omega::<Fr>(v13_coeffs.len());
+
+        let mut v21_coeffs = v11_coeffs.clone();
+        let mut v22_coeffs = v12_coeffs.clone();
+        let mut v23_coeffs = v13_coeffs.clone();
+        let v21_omega = v11_omega;
+        let v22_omega = v12_omega;
+        let v23_omega = v13_omega;
+
+        println!("Testing FFT3 for {} elements...", d);
+
+        let mut now = Instant::now();
+        kern.radix_fft_many(
+            &mut [&mut v11_coeffs, &mut v12_coeffs, &mut v13_coeffs],
+            &[v11_omega, v12_omega, v13_omega],
+            &[log_d, log_d, log_d],
+        )
+        .expect("GPU FFT failed!");
+        let gpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
+        println!("GPU took {}ms.", gpu_dur);
+
+        now = Instant::now();
+        if log_d <= log_threads {
+            serial_fft::<Fr>(&mut v21_coeffs, &v21_omega, log_d);
+            serial_fft::<Fr>(&mut v22_coeffs, &v22_omega, log_d);
+            serial_fft::<Fr>(&mut v23_coeffs, &v23_omega, log_d);
+        } else {
+            parallel_fft::<Fr>(&mut v21_coeffs, &worker, &v21_omega, log_d, log_threads);
+            parallel_fft::<Fr>(&mut v22_coeffs, &worker, &v22_omega, log_d, log_threads);
+            parallel_fft::<Fr>(&mut v23_coeffs, &worker, &v23_omega, log_d, log_threads);
+        }
+        let cpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
+        println!("CPU ({} cores) took {}ms.", 1 << log_threads, cpu_dur);
+
+        println!("Speedup: x{}", cpu_dur as f32 / gpu_dur as f32);
+
+        assert!(v11_coeffs == v21_coeffs);
+        assert!(v12_coeffs == v22_coeffs);
+        assert!(v13_coeffs == v23_coeffs);
+
+        println!("============================");
+    }
 }
