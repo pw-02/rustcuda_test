@@ -67,7 +67,7 @@ pub fn gpu_fft_consistency() {
 }
 
 #[test]
-pub fn gpu_fft_many_consistency() {
+pub fn main() {
     fil_logger::maybe_init();
     let mut rng = rand::thread_rng();
 
